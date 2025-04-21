@@ -1,0 +1,4 @@
+[submodule "spot_mobility_controller"]
+	path = spot_mobility_controller
+	url = git@github.com:strapsai/spot_mobility_controller.git
+	branch = main
