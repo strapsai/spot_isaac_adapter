@@ -1,0 +1,24 @@
+# Configuration file for Spot Isaac Adapter
+# This file allows customizing the ROS2 topics and QoS settings
+
+# Topics configuration
+# All topics will be automatically prefixed with the robot namespace from ROBOT_NAME env variable
+topics:
+  # Command topics
+  trajectory: '/cmd_trajectory'
+  velocity: '/cmd_velocity'
+  stand: '/cmd_stand'
+  sit: '/cmd_sit'
+  arm_pose: '/cmd_arm_pose'
+  gripper: '/cmd_gripper'
+  arm_joints: '/cmd_arm_joints'
+
+  # Optional feedback topics (uncomment to enable)
+  # trajectory_feedback: '/feedback/trajectory'
+  # arm_pose_feedback: '/feedback/arm_pose'
+  # gripper_feedback: '/feedback/gripper'
+
+# QoS (Quality of Service) settings
+qos:
+  depth: 10             # Queue size for each topic
+  reliability: 'reliable'  # Options: 'reliable' or 'best_effort'
