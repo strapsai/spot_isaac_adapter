@@ -27,6 +27,7 @@ import time
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
+import asyncio
 
 # Start Isaac Sim's simulation environment (must be instantiated right after the import)
 simulation_app = SimulationApp({"headless": False})
@@ -46,7 +47,12 @@ from isaacsim.core.prims import SingleArticulation
 from isaacsim.robot.policy.examples.controllers import PolicyController
 from omni.isaac.core import World
 from isaacsim.robot.policy.examples.controllers.config_loader import get_robot_joint_properties
+from omni.isaac.core.utils.extensions import disable_extension, enable_extension
 
+
+# Enable/disable ROS bridge extensions to keep only ROS2 Bridge
+disable_extension("omni.isaac.ros_bridge")
+enable_extension("omni.isaac.ros2_bridge")
 
 class ROS2CommandSubscriber(Node):
     """
@@ -134,6 +140,7 @@ class ROS2CommandSubscriber(Node):
         self.keyboard_active = True
         self.last_keyboard_time = time.time()
 
+
 class SpotWithArmFlatTerrainPolicy(PolicyController):
     """The Spot quadruped with arm, using body-only policy"""
 
@@ -191,27 +198,12 @@ class SpotWithArmFlatTerrainPolicy(PolicyController):
             # Add stage event subscription for Action Graph handling
             self._stage_event_sub = None
 
+
+
             carb.log_info(f"Successfully created SpotWithArmFlatTerrainPolicy object for {prim_path}")
         except Exception as e:
             carb.log_error(f"Error initializing SpotWithArmFlatTerrainPolicy: {str(e)}")
             raise
-
-    def _setup_stage_events(self):
-        """
-        Set up stage events to handle Action Graph activation
-        """
-        import omni.usd
-        from pxr import Tf
-
-        # Get the stage
-        stage = omni.usd.get_context().get_stage()
-
-        # Subscribe to stage events
-        self._stage_event_sub = Tf.Notice.Register(
-            Usd.Notice.ObjectsChanged,
-            self._on_stage_event,
-            stage
-        )
 
     def initialize(self, **kwargs):
         """
@@ -504,9 +496,14 @@ class StandaloneQuadrupedApp:
 
         # Physics flag to track initialization
         self._physics_ready = False
+        self._action_graphs_initialized = False
 
         # Flag to track simulation state
         self.stop_sim = False
+
+        # Action graph related variables
+        self._action_graph = None
+        self._on_tick_nodes = []  # Store all OnTick/OnPlaybackTick nodes
 
         # Reset the simulation environment
         self.world.reset()
@@ -569,8 +566,6 @@ class StandaloneQuadrupedApp:
                 position=np.array([0, 0, 0.8]),
             )
 
-            self._setup_stage_events()
-
             carb.log_info("Created Spot robot controller for Omniverse USD")
         else:
             # Local file approach
@@ -582,8 +577,6 @@ class StandaloneQuadrupedApp:
                     usd_path=self.usd_path,
                     position=np.array([0, 0, 0.8]),
                 )
-
-                self._setup_stage_events()
 
                 carb.log_info("Successfully created Spot robot instance")
             except Exception as e:
@@ -607,6 +600,25 @@ class StandaloneQuadrupedApp:
             int(omni.timeline.TimelineEventType.STOP), self._timeline_timer_callback_fn
         )
 
+    def _ensure_robot_loaded(self):
+        """
+        Ensure the robot is fully loaded before trying to access Action Graphs
+        """
+        try:
+            # Wait for a few physics steps before trying Action Graphs
+            if not hasattr(self, '_robot_load_counter'):
+                self._robot_load_counter = 0
+
+            self._robot_load_counter += 1
+
+            # Only try after robot has been initialized
+            if self._robot_load_counter > 10 and self.spot and self.spot.robot:
+                return True
+
+            return False
+        except:
+            return False
+
     def setup_callbacks(self):
         """
         Sets up input and physics callbacks.
@@ -620,136 +632,146 @@ class StandaloneQuadrupedApp:
         # Add physics step callback
         self.world.add_physics_callback("physics_step", self.on_physics_step)
 
-    def _ensure_action_graphs_enabled(self):
+    def _initialize_ros2_bridge(self):
         """
-        Ensure all Action Graphs in the robot are enabled
+        Initialize ROS2 bridge if needed
         """
         try:
-            # Import omni.graph.core here if not imported globally
-            import omni.graph.core as og
+            carb.log_info("Attempting to initialize ROS2 bridge...")
 
-            # Method 1: Try synchronous approach first
-            carb.log_info("Attempting to enable Action Graphs synchronously...")
+            # Import and enable the ROS2 bridge extension
+            import omni.kit.app
+            manager = omni.kit.app.get_app().get_extension_manager()
 
-            # Enable Action Graphs immediately
-            all_graphs = og.get_all_graphs()
-            carb.log_info(f"Found {len(all_graphs)} Action Graphs total")
+            # Enable the extension if it's not already enabled
+            if not manager.is_extension_enabled("omni.isaac.ros2_bridge"):
+                carb.log_info("Enabling ROS2 bridge extension...")
+                manager.set_extension_enabled_immediate("omni.isaac.ros2_bridge", True)
+                time.sleep(1.0)  # Give it time to load
 
-            spot_graphs_found = 0
-            for graph in all_graphs:
-                graph_path = graph.get_path_to_graph()
-                carb.log_info(f"Checking graph: {graph_path}")
+            # Import after enabling
+            import omni.isaac.ros2_bridge
 
-                if "/World/Spot" in graph_path or "spot" in graph_path.lower():
-                    spot_graphs_found += 1
-                    carb.log_info(f"Found Spot Action Graph: {graph_path}")
-
-                    # Try different methods to enable the graph
-                    try:
-                        # Method 1: Use enable() if available
-                        if hasattr(graph, 'enable'):
-                            graph.enable()
-                            carb.log_info(f"Enabled Action Graph using enable(): {graph_path}")
-                        # Method 2: Use set_enabled() if available
-                        elif hasattr(graph, 'set_enabled'):
-                            graph.set_enabled(True)
-                            carb.log_info(f"Enabled Action Graph using set_enabled(): {graph_path}")
-                        # Method 3: Use evaluate() to force execution
-                        elif hasattr(graph, 'evaluate'):
-                            graph.evaluate()
-                            carb.log_info(f"Evaluated Action Graph: {graph_path}")
-                        else:
-                            carb.log_warn(f"No known enable method for graph: {graph_path}")
-                    except Exception as graph_error:
-                        carb.log_error(f"Error enabling graph {graph_path}: {graph_error}")
-
-            if spot_graphs_found == 0:
-                carb.log_warn("No Action Graphs found for Spot robot")
+            # Initialize if the method exists
+            if hasattr(omni.isaac.ros2_bridge, 'initialize'):
+                result = omni.isaac.ros2_bridge.initialize()
+                carb.log_info(f"ROS2 bridge initialization result: {result}")
             else:
-                carb.log_info(f"Processed {spot_graphs_found} Spot Action Graphs")
+                carb.log_info("ROS2 bridge initialize method not found")
 
         except Exception as e:
-            carb.log_error(f"Error ensuring Action Graphs are enabled: {str(e)}")
-            import traceback
-            carb.log_error(f"Traceback: {traceback.format_exc()}")
+            carb.log_error(f"Error initializing ROS2 bridge: {e}")
 
-    def _ensure_action_graphs_running(self):
+    def _find_and_initialize_action_graph(self):
         """
-        Periodically check and ensure Action Graphs are running (called from physics step)
+        Find and properly initialize the ROS2_Camera_and_TFs Action Graph using forum solution
         """
+        carb.log_info("Searching for ROS2_Camera_and_TFs Action Graph...")
+
         try:
-            # Get all graphs and check if they belong to our robot
-            all_graphs = og.get_all_graphs()
+            # Potential paths for the action graph
+            graph_paths = [
+                "/World/Spot/ROS2_Camera_and_TFs",
+                "/World/Spot/body/ROS2_Camera_and_TFs"
+            ]
 
-            for graph in all_graphs:
-                graph_path = graph.get_path_to_graph()
+            found_graph = None
+            for path in graph_paths:
+                try:
+                    graph = og.get_graph_by_path(path)
+                    if graph:
+                        carb.log_info(f"Found Action Graph at: {path}")
+                        found_graph = graph
+                        self._action_graph = graph
+                        break
+                except:
+                    continue
 
-                if "/World/Spot" in graph_path or "spot" in graph_path.lower():
-                    # Try to evaluate/enable the graph
+            if not found_graph:
+                # Search all graphs
+                all_graphs = og.get_all_graphs()
+                carb.log_info(f"Searching through {len(all_graphs)} graphs...")
+
+                for graph in all_graphs:
                     try:
-                        # Method 1: Check if enabled using different approaches
-                        is_enabled = True  # Assume enabled by default
+                        graph_path = graph.get_path_to_graph()
+                        if "ROS2_Camera_and_TFs" in graph_path or (
+                                "ROS2" in graph_path and "/World/Spot" in graph_path):
+                            carb.log_info(f"Found matching graph: {graph_path}")
+                            found_graph = graph
+                            self._action_graph = graph
+                            break
+                    except:
+                        continue
 
-                        # Try different ways to check if enabled
-                        if hasattr(graph, 'get_enabled'):
-                            is_enabled = graph.get_enabled()
-                        elif hasattr(graph, 'is_enabled'):
-                            is_enabled = graph.is_enabled()
-                        elif hasattr(graph, 'enabled'):
-                            is_enabled = graph.enabled()
+            if found_graph:
+                # Find all OnTick/OnPlaybackTick nodes in the graph
+                nodes = found_graph.get_nodes()
+                self._on_tick_nodes = []
 
-                        if not is_enabled:
-                            carb.log_info(f"Re-enabling Action Graph: {graph_path}")
-                            # Try to enable
-                            if hasattr(graph, 'enable'):
-                                graph.enable()
-                            elif hasattr(graph, 'set_enabled'):
-                                graph.set_enabled(True)
+                for node in nodes:
+                    try:
+                        node_type = node.get_type_name()
+                        node_path = node.get_path()
+                        carb.log_info(f"Found node: {node_type} at {node_path}")
 
-                        # Always try to evaluate the graph to ensure it runs
-                        if hasattr(graph, 'evaluate'):
-                            graph.evaluate()
+                        # Look for OnTick or OnPlaybackTick nodes
+                        if "OnPlaybackTick" in node_type or "OnTick" in node_type:
+                            self._on_tick_nodes.append(node)
+                            carb.log_info(f"Added OnTick node: {node_type} at {node_path}")
+                    except:
+                        continue
 
-                    except Exception as graph_error:
-                        carb.log_debug(f"Error with graph {graph_path}: {graph_error}")
+                # Enable the graph
+                try:
+                    if hasattr(found_graph, 'enable'):
+                        found_graph.enable()
+                        carb.log_info("Enabled graph using enable()")
+
+                    if hasattr(found_graph, 'set_enabled'):
+                        found_graph.set_enabled(True)
+                        carb.log_info("Enabled graph using set_enabled()")
+
+                    # Remove the evaluator code that's causing errors
+                    # No evaluator configuration needed
+
+                except Exception as e:
+                    carb.log_error(f"Error configuring graph: {e}")
+
+                # Mark as initialized
+                self._action_graphs_initialized = True
+                carb.log_info(f"Action Graph successfully initialized with {len(self._on_tick_nodes)} tick nodes!")
+                return True
+            else:
+                carb.log_warn("No ROS2_Camera_and_TFs Action Graph found!")
+                return False
 
         except Exception as e:
-            carb.log_error(f"Error ensuring Action Graphs are running: {str(e)}")
+            carb.log_error(f"Error finding action graph: {e}")
+            return False
 
-    def _on_stage_event(self, notice, sender):
+    def _trigger_action_graph_impulse(self):
         """
-        Handle stage events to enable Action Graphs when robot is loaded
+        Manually trigger the action graph using impulse events as suggested in the forum
         """
         try:
-            # Check if changes involve our robot
-            changed_paths = notice.GetChangedInfoOnlyPaths()
+            if self._action_graph and self._on_tick_nodes:
+                # Use Controller to set impulse on OnTick nodes
+                controller = og.Controller()
 
-            for path in changed_paths:
-                path_str = str(path)
-                if "/World/Spot" in path_str:
-                    # Robot was modified, ensure Action Graphs are enabled
-                    self._ensure_action_graphs_enabled()
-                    break
+                for node in self._on_tick_nodes:
+                    try:
+                        node_path = node.get_path()
+                        # Set enableImpulse to True using the Controller (forum solution)
+                        impulse_attr = f"{node_path}.state:enableImpulse"
+                        controller.set(impulse_attr, True)
+                        carb.log_debug(f"Triggered impulse on: {node_path}")
+                    except Exception as e:
+                        carb.log_debug(f"Failed to trigger node {node_path}: {e}")
+                        continue
 
         except Exception as e:
-            carb.log_error(f"Error in stage event handler: {str(e)}")
-
-    def _setup_stage_events(self):
-        """
-        Set up stage events to handle Action Graph activation
-        """
-        import omni.usd
-        from pxr import Tf
-
-        # Get the stage
-        stage = omni.usd.get_context().get_stage()
-
-        # Subscribe to stage events
-        self._stage_event_sub = Tf.Notice.Register(
-            Usd.Notice.ObjectsChanged,
-            self._on_stage_event,
-            stage
-        )
+            carb.log_error(f"Error triggering action graph impulse: {e}")
 
     def _check_files_exist(self):
         """
@@ -777,16 +799,12 @@ class StandaloneQuadrupedApp:
                 carb.log_error(f"{file_desc} not found: {file_path}")
                 carb.log_info(f"Please verify that the path {file_path} is correct and accessible.")
                 carb.log_info("If using Omniverse URLs, set SKIP_OMNIVERSE_CHECK = True at the top of the file.")
+
                 raise FileNotFoundError(f"{file_desc} not found: {file_path}")
-            else:
-                carb.log_info(f"{file_desc} found: {file_path}")
 
     def on_physics_step(self, step_size):
         """
         Physics step callback - updates robot state and ensures Action Graphs run.
-
-        Args:
-            step_size (float): The physics step size.
         """
         # Process ROS2 callbacks
         rclpy.spin_once(self.ros2_node, timeout_sec=0)
@@ -798,9 +816,41 @@ class StandaloneQuadrupedApp:
         if not hasattr(self, '_physics_counter'):
             self._physics_counter = 0
 
-        # Ensure Action Graphs are running (do this periodically)
-        if self._physics_ready and self._physics_counter % 120 == 0:  # Every 120 steps (about every 2 seconds)
-            self._ensure_action_graphs_running()
+        # Special handling for first few physics steps
+        if self._physics_counter < 10:
+            carb.log_info(f"Physics step {self._physics_counter + 1}/10 - Initializing...")
+
+        # Action Graph initialization sequence
+        if not self._action_graphs_initialized:
+            # First attempt after robot is loaded
+            if self._physics_counter == 10 and self._ensure_robot_loaded():
+                carb.log_info("First attempt to initialize Action Graphs...")
+                # Initialize ROS2 bridge first
+                self._initialize_ros2_bridge()
+                success = self._find_and_initialize_action_graph()
+                if success:
+                    carb.log_info("Action Graphs successfully initialized!")
+
+            # Second attempt if first failed
+            elif self._physics_counter == 30:
+                carb.log_info("Second attempt to initialize Action Graphs...")
+                success = self._find_and_initialize_action_graph()
+                if success:
+                    carb.log_info("Action Graphs successfully initialized!")
+
+            # Third attempt if previous failed
+            elif self._physics_counter == 60:
+                carb.log_info("Third attempt to initialize Action Graphs...")
+                success = self._find_and_initialize_action_graph()
+                if not success:
+                    carb.log_warn("Failed to initialize Action Graphs after multiple attempts")
+                    # Set flag to prevent further attempts
+                    self._action_graphs_initialized = True
+
+        # Trigger action graph using the forum solution (KEY CHANGE!)
+        if self._action_graphs_initialized and self._action_graph:
+            # Use the impulse method from the forum solution
+            self._trigger_action_graph_impulse()
 
         if self._physics_ready:
             # Forward command to robot
@@ -810,43 +860,35 @@ class StandaloneQuadrupedApp:
             self._physics_ready = True
 
             try:
-                # Custom policy loading with specific paths
+                # Load and initialize the robot
                 carb.log_info(f"Loading policy from: {self.policy_path}")
-                carb.log_info(f"Loading environment config from: {self.env_path}")
                 self.spot.load_policy(self.policy_path, self.env_path)
-                carb.log_info("Successfully loaded policy")
-            except Exception as e:
-                carb.log_error(f"Failed to load policy: {str(e)}")
-                carb.log_info("Attempting to use default policy...")
-
-                # Try to load default policy from Isaac Sim
-                try:
-                    default_policy = "omniverse://localhost/Isaac/Samples/Policies/Spot_Policies/spot_policy.pt"
-                    default_env = "omniverse://localhost/Isaac/Samples/Policies/Spot_Policies/spot_env.yaml"
-
-                    carb.log_info(f"Using fallback policy: {default_policy}")
-                    carb.log_info(f"Using fallback env config: {default_env}")
-
-                    self.spot.load_policy(default_policy, default_env)
-                    carb.log_info("Successfully loaded default policy")
-                except Exception as e2:
-                    carb.log_error(f"Failed to load default policy: {str(e2)}")
-                    carb.log_error("Robot will not be controlled by RL policy!")
-
-            try:
                 self.spot.initialize()
                 self.spot.post_reset()
-                self.spot.robot.set_joints_default_state(self.spot.default_pos)
-                carb.log_info("Robot initialized successfully")
 
-                # Enable Action Graphs after robot initialization
-                self._ensure_action_graphs_enabled()
+                # Create full default state for all joints
+                full_default_state = np.zeros(self.spot.robot.num_dof)
+
+                # Set leg joints using the mapping
+                for policy_idx, robot_idx in self.spot._joint_mapping.items():
+                    if policy_idx < len(self.spot.default_pos) and robot_idx < len(full_default_state):
+                        full_default_state[robot_idx] = self.spot.default_pos[policy_idx]
+
+                # Set arm joints using the mapping
+                for i, joint_name in enumerate(self.spot.ARM_JOINT_NAMES):
+                    if joint_name in self.spot._arm_joint_mapping and i < len(self.spot.ARM_DEFAULT_POSITIONS):
+                        robot_idx = self.spot._arm_joint_mapping[joint_name]
+                        if robot_idx < len(full_default_state):
+                            full_default_state[robot_idx] = self.spot.ARM_DEFAULT_POSITIONS[i]
+
+                # Set the default state with all joint positions
+                self.spot.robot.set_joints_default_state(full_default_state)
+                carb.log_info("Robot initialized successfully")
 
             except Exception as e:
                 carb.log_error(f"Failed to initialize robot: {str(e)}")
                 self._physics_ready = False
 
-        # Increment physics counter
         self._physics_counter += 1
 
     def _sub_keyboard_event(self, event, *args, **kwargs):
@@ -895,6 +937,11 @@ class StandaloneQuadrupedApp:
 
             # Reset physics-ready flag so initialization happens again
             self._physics_ready = False
+            self._action_graphs_initialized = False
+
+            # Reset action graph references
+            self._action_graph = None
+            self._on_tick_nodes = []
 
             # Reset the simulation
             self.reset_simulation()
@@ -904,9 +951,8 @@ class StandaloneQuadrupedApp:
 
     def _schedule_restart(self):
         """
-        Schedule a delayed restart of the timeline
+        Schedule a delayed restart of the timeline using asyncio
         """
-        import asyncio
 
         async def delayed_restart():
             # Wait a short time for complete stop
@@ -916,10 +962,18 @@ class StandaloneQuadrupedApp:
             carb.log_info("Restarting simulation...")
             self.timeline.play()
 
-        # Get the event loop and schedule the restart
-        import omni.kit.app
-        app = omni.kit.app.get_app()
-        app.get_async_loop().create_task(delayed_restart())
+        # Use asyncio directly
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(delayed_restart())
+            else:
+                loop.run_until_complete(delayed_restart())
+        except RuntimeError:
+            # If no event loop exists, create a new one
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(delayed_restart())
 
     def reset_simulation(self):
         """
@@ -1011,3 +1065,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
