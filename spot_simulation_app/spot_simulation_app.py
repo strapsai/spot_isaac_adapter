@@ -35,24 +35,543 @@ simulation_app = SimulationApp({"headless": False})
 # -----------------------------------
 # The actual script should start here
 # -----------------------------------
-from pxr import Usd, UsdGeom, Gf, Tf
+
+# USD / Pixar
+from pxr import Usd, UsdGeom, Gf, Tf, Sdf
+
+# Basic Omni and Isaac imports
 import omni.graph.core as og
 import omni.graph.tools as ogt
-
 import omni.timeline
 import omni.appwindow
+
+# Core Isaac Sim functionality
 from isaacsim.core.utils.rotations import quat_to_rot_matrix
 from isaacsim.core.utils.types import ArticulationAction
-from isaacsim.core.prims import SingleArticulation
 from isaacsim.robot.policy.examples.controllers import PolicyController
-from omni.isaac.core import World
 from isaacsim.robot.policy.examples.controllers.config_loader import get_robot_joint_properties
+from omni.isaac.core import World
+from omni.isaac.core.utils import prims
 from omni.isaac.core.utils.extensions import disable_extension, enable_extension
 
+# Other utilities
+import omni.client
+import omni.kit.commands
+from omni.usd import get_stage_next_free_path
+from omni.isaac.nucleus import get_assets_root_path
+from scipy.spatial.transform import Rotation
 
-# Enable/disable ROS bridge extensions to keep only ROS2 Bridge
+
+# Enable the required extensions for the simulation
+EXTENSIONS_PEOPLE = [
+    'omni.anim.graph.core',  # Load core first
+    'omni.anim.graph.bundle',  # Then bundle
+    'omni.anim.curve.core',  # Curve support
+    'omni.anim.timeline',  # Timeline support
+    'omni.anim.retarget.core',  # Retargeting core
+    'omni.anim.people',  # People (loads schemas)
+    'omni.anim.navigation.bundle',  # Navigation
+    'omni.anim.graph.ui',  # UI components
+    'omni.anim.retarget.bundle',  # Retargeting bundle
+    'omni.anim.retarget.ui',  # Retargeting UI
+    'omni.kit.scripting',  # Scripting support
+    'omni.graph.io',  # Graph I/O
+]
+
+# Enable people extensions with proper error handling and delays
+carb.log_info("Enabling people extensions...")
+for i, ext_people in enumerate(EXTENSIONS_PEOPLE):
+    try:
+        carb.log_info(f"Enabling extension {i + 1}/{len(EXTENSIONS_PEOPLE)}: {ext_people}")
+        enable_extension(ext_people)
+
+        # Small delay between extensions to ensure proper loading
+        if i < len(EXTENSIONS_PEOPLE) - 1:
+            time.sleep(0.2)
+
+        carb.log_info(f"Successfully enabled {ext_people}")
+    except Exception as e:
+        carb.log_error(f"Failed to enable {ext_people}: {e}")
+
+# Enable/disable ROS bridge extensions
 disable_extension("omni.isaac.ros_bridge")
 enable_extension("omni.isaac.ros2_bridge")
+
+# NOW import the animation modules after extensions are enabled
+try:
+    import omni.anim.graph.core as ag
+    from omni.anim.people import PeopleSettings
+    carb.log_info("Successfully imported animation modules")
+except ImportError as e:
+    carb.log_error(f"Failed to import animation modules: {e}")
+    # Set a flag to disable people functionality if animation import fails
+    ANIMATION_AVAILABLE = False
+else:
+    ANIMATION_AVAILABLE = True
+
+
+class StandalonePersonController:
+    """Base controller class for person behavior"""
+
+    def __init__(self):
+        self._person = None
+
+    @property
+    def person(self):
+        return self._person
+
+    def initialize(self, person):
+        self._person = person
+
+    def update_state(self, state):
+        pass
+
+    def update(self, dt: float):
+        pass
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def reset(self):
+        pass
+
+
+class RandomWalkPersonController(StandalonePersonController):
+    """Controller that makes a person walk randomly"""
+
+    def __init__(self):
+        super().__init__()
+        self._current_direction = np.random.uniform(0, 2 * np.pi)
+        self._speed = 1.0
+        self._last_direction_change = 0.0
+        self._direction_change_interval = np.random.uniform(2.0, 5.0)
+        self._position = np.array([0.0, 0.0, 0.0])
+
+    def update(self, dt: float):
+        if not self._person:
+            return
+
+        # Update timer
+        self._last_direction_change += dt
+
+        # Occasionally change direction
+        if self._last_direction_change >= self._direction_change_interval:
+            if np.random.random() < 0.2:
+                self._current_direction += np.random.uniform(-np.pi / 3, np.pi / 3)
+
+            self._last_direction_change = 0.0
+            self._direction_change_interval = np.random.uniform(2.0, 5.0)
+
+        # Calculate new position
+        dx = self._speed * np.cos(self._current_direction) * dt
+        dy = self._speed * np.sin(self._current_direction) * dt
+
+        self._position[0] += dx
+        self._position[1] += dy
+
+        # Update the person's target position
+        self._person.update_target_position(self._position)
+
+
+class PersonState:
+    """Simple state class for person"""
+
+    def __init__(self):
+        self.position = np.array([0.0, 0.0, 0.0])
+        self.orientation = np.array([0.0, 0.0, 0.0, 1.0])
+
+
+class StandalonePerson:
+    """Standalone person implementation that doesn't depend on Pegasus"""
+
+    # Get root assets path from settings
+    setting_dict = carb.settings.get_settings()
+    people_asset_folder = setting_dict.get(PeopleSettings.CHARACTER_ASSETS_PATH)
+    character_root_prim_path = setting_dict.get(PeopleSettings.CHARACTER_PRIM_PATH)
+    assets_root_path = None
+
+    if not character_root_prim_path:
+        character_root_prim_path = "/World/Characters"
+
+    if people_asset_folder:
+        assets_root_path = people_asset_folder
+    else:
+        try:
+            root_path = get_assets_root_path()
+            if root_path is not None:
+                assets_root_path = "{}/Isaac/People/Characters".format(root_path)
+            else:
+                assets_root_path = None
+                carb.log_warn("Assets root path is None, people functionality will be limited")
+        except RuntimeError:
+            carb.log_warn("Could not find assets root folder, people functionality will be limited")
+            assets_root_path = None
+
+
+    def __init__(
+            self,
+            world,
+            stage_prefix: str,
+            character_name: str = None,
+            init_pos=[0.0, 0.0, 0.0],
+            init_yaw=0.0,
+            controller: StandalonePersonController = None
+    ):
+        """Initialize the person object"""
+
+        # Reference to world and stage
+        self._world = world
+        self._current_stage = self._world.stage
+
+        # State management
+        self._state = PersonState()
+        self._state.position = np.array(init_pos)
+        self._state.orientation = Rotation.from_euler('z', init_yaw, degrees=False).as_quat()
+
+        # Target for movement
+        self._target_position = np.array(init_pos)
+        self._target_speed = 1.0
+
+        # Get unique stage path
+        self._stage_prefix = get_stage_next_free_path(
+            self._current_stage,
+            StandalonePerson.character_root_prim_path + '/' + stage_prefix,
+            False
+        )
+
+        # Character assets
+        self._character_name = character_name
+        self.char_usd_file = self.get_path_for_character_prim(character_name)
+
+        # Initialize simulation flags
+        self._sim_running = False
+        self.character_graph = None
+        self.character_skel_root = None
+        self.character_skel_root_stage_path = None
+
+        # Spawn the person
+        self.spawn_agent(self.char_usd_file, self._stage_prefix, init_pos, init_yaw)
+        self.add_animation_graph_to_agent()
+
+        # Add callbacks
+        self._world.add_physics_callback(self._stage_prefix + "/state", self.update_state)
+        self._world.add_physics_callback(self._stage_prefix + "/update", self.update)
+        self._world.add_timeline_callback(self._stage_prefix + "/start_stop_sim", self.sim_start_stop)
+
+    @property
+    def state(self):
+        return self._state
+
+    def sim_start_stop(self, event):
+        """Handle simulation start/stop events"""
+        if self._world.is_playing() and not self._sim_running:
+            self._sim_running = True
+            self.start()
+        elif self._world.is_stopped() and self._sim_running:
+            self._sim_running = False
+            self.stop()
+
+    def start(self):
+        if self._controller:
+            self._controller.start()
+
+    def stop(self):
+        if self._controller:
+            self._controller.stop()
+
+    def update(self, dt: float):
+        """Update person movement and animation"""
+
+        # Get character graph with retry logic
+        if not self.character_graph:
+            self.character_graph = ag.get_character(self.character_skel_root_stage_path)
+            if not self.character_graph:
+                # Try alternative method if first fails
+                try:
+                    # Sometimes the stage path needs to be the skeleton root path
+                    skel_path = str(self.character_skel_root.GetPrimPath())
+                    self.character_graph = ag.get_character(skel_path)
+                except:
+                    pass
+
+        # Only proceed if we have a valid graph
+        if not self.character_graph:
+            carb.log_info(f"Character graph not ready yet for {self._stage_prefix}")
+            return
+
+        # Update controller
+        if self._controller:
+            self._controller.update(dt)
+
+        # Calculate distance to target
+        distance_to_target = np.linalg.norm(self._target_position - self._state.position)
+
+        # Set animation based on distance to target
+        try:
+            if distance_to_target > 0.1:
+                self.character_graph.set_variable("Action", "Walk")
+
+                # Convert numpy arrays to carb.Float3 properly
+                current_pos = carb.Float3(float(self._state.position[0]),
+                                          float(self._state.position[1]),
+                                          float(self._state.position[2]))
+                target_pos = carb.Float3(float(self._target_position[0]),
+                                         float(self._target_position[1]),
+                                         float(self._target_position[2]))
+
+                self.character_graph.set_variable("PathPoints", [current_pos, target_pos])
+                self.character_graph.set_variable("Walk", float(self._target_speed))
+            else:
+                self.character_graph.set_variable("Walk", 0.0)
+                self.character_graph.set_variable("Action", "Idle")
+        except Exception as e:
+            carb.log_error(f"Error setting character graph variables: {e}")
+            # Reset character_graph to None so it will be recreated next frame
+            self.character_graph = None
+
+    def update_target_position(self, position, walk_speed=1.0):
+        """Update the target position and walking speed"""
+        self._target_position = np.array(position)
+        self._target_speed = walk_speed
+
+    def update_state(self, dt: float):
+        """Update the person's current state from simulation"""
+
+        # Get character graph with retry logic
+        if not self.character_graph:
+            self.character_graph = ag.get_character(self.character_skel_root_stage_path)
+            if not self.character_graph:
+                try:
+                    skel_path = str(self.character_skel_root.GetPrimPath())
+                    self.character_graph = ag.get_character(skel_path)
+                except:
+                    pass
+
+        if not self.character_graph:
+            carb.log_info(f"Character graph not ready for state update: {self._stage_prefix}")
+            return
+
+        # Get world transform with error handling
+        try:
+            pos = carb.Float3(0, 0, 0)
+            rot = carb.Float4(0, 0, 0, 0)
+            self.character_graph.get_world_transform(pos, rot)
+
+            # Update state
+            self._state.position = np.array([pos[0], pos[1], pos[2]])
+            self._state.orientation = np.array([rot.x, rot.y, rot.z, rot.w])
+
+            # Notify controller
+            if self._controller:
+                self._controller.update_state(self._state)
+        except Exception as e:
+            carb.log_error(f"Error getting world transform: {e}")
+            # Reset character_graph to None so it will be recreated next frame
+            self.character_graph = None
+
+    def spawn_agent(self, usd_file, stage_name, init_pos, init_yaw):
+        """Spawn the character in the simulation"""
+
+        # Ensure character root exists
+        if not self._current_stage.GetPrimAtPath(StandalonePerson.character_root_prim_path):
+            prims.create_prim(StandalonePerson.character_root_prim_path, "Xform")
+
+        # Ensure biped setup exists
+        biped_path = StandalonePerson.character_root_prim_path + "/Biped_Setup"
+        if not self._current_stage.GetPrimAtPath(biped_path):
+            biped_usd = StandalonePerson.assets_root_path + "/Biped_Setup.usd"
+            prim = prims.create_prim(biped_path, "Xform", usd_path=biped_usd)
+            prim.GetAttribute("visibility").Set("invisible")
+
+        # Create the character prim
+        if not usd_file:
+            carb.log_error(f"Could not find USD file for character: {self._character_name}")
+            return
+
+        self.prim = prims.create_prim(stage_name, "Xform", usd_path=usd_file)
+
+        # Set initial transform
+        self.prim.GetAttribute("xformOp:translate").Set(
+            Gf.Vec3d(float(init_pos[0]), float(init_pos[1]), float(init_pos[2]))
+        )
+
+        # Set initial rotation
+        rotation = Gf.Rotation(Gf.Vec3d(0, 0, 1), float(init_yaw))
+        orient_attr = self.prim.GetAttribute("xformOp:orient")
+        if orient_attr.Get() is not None and isinstance(orient_attr.Get(), Gf.Quatf):
+            orient_attr.Set(Gf.Quatf(rotation.GetQuat()))
+        else:
+            orient_attr.Set(rotation.GetQuat())
+
+        # Find skeleton root
+        self.character_skel_root, self.character_skel_root_stage_path = self._find_skel_root(
+            self._current_stage, self._stage_prefix
+        )
+
+    def add_animation_graph_to_agent(self):
+        """Add animation graph to the character with improved error handling"""
+
+        if not self.character_skel_root:
+            carb.log_warn("No skeleton root found, cannot add animation graph")
+            return
+
+        try:
+            # Get animation graph path
+            anim_graph_path = StandalonePerson.character_root_prim_path + "/Biped_Setup/CharacterAnimation/AnimationGraph"
+            animation_graph = self._current_stage.GetPrimAtPath(anim_graph_path)
+
+            if not animation_graph.IsValid():
+                carb.log_error(f"Animation graph not found at {anim_graph_path}")
+                # Try alternative path
+                alt_path = StandalonePerson.character_root_prim_path + "/Biped_Setup/AnimationGraph"
+                animation_graph = self._current_stage.GetPrimAtPath(alt_path)
+                if animation_graph.IsValid():
+                    anim_graph_path = alt_path
+                else:
+                    return
+
+            # Simply attempt to remove any existing animation graph API
+            # without checking if it exists first (avoiding HasAPI)
+            try:
+                # Try newer API first
+                try:
+                    omni.kit.commands.execute(
+                        "RemoveAnimationGraphAPICommand",
+                        paths=[self.character_skel_root.GetPrimPath()]
+                    )
+                    carb.log_info(
+                        "Successfully removed existing animation graph API using RemoveAnimationGraphAPICommand")
+                except:
+                    # Fallback to older API
+                    try:
+                        omni.kit.commands.execute(
+                            "RemoveAnimationGraphAPI",
+                            prim_path=self.character_skel_root.GetPrimPath()
+                        )
+                        carb.log_info("Successfully removed existing animation graph API using RemoveAnimationGraphAPI")
+                    except Exception as e:
+                        # It's okay if this fails - likely means there was no API to remove
+                        carb.log_info(f"No animation graph API to remove: {e}")
+            except Exception as e:
+                # Non-critical error, can continue
+                carb.log_warn(f"Could not remove old animation graph API: {e}")
+
+            # Add new animation graph API - use newer API if available
+            try:
+                # Try newer API first
+                omni.kit.commands.execute(
+                    "ApplyAnimationGraphAPICommand",
+                    paths=[self.character_skel_root.GetPrimPath()],
+                    animation_graph_path=animation_graph.GetPrimPath()
+                )
+                carb.log_info("Successfully applied animation graph API using ApplyAnimationGraphAPICommand")
+            except Exception as e1:
+                # Fallback to older API
+                try:
+                    omni.kit.commands.execute(
+                        "ApplyAnimationGraphAPI",
+                        prim_path=self.character_skel_root.GetPrimPath(),
+                        animation_graph_path=animation_graph.GetPrimPath()
+                    )
+                    carb.log_info("Successfully applied animation graph API using ApplyAnimationGraphAPI")
+                except Exception as e2:
+                    carb.log_error(f"Failed to apply animation graph API: {e1}, fallback also failed: {e2}")
+                    return
+
+            carb.log_info(f"Successfully applied animation graph to {self.character_skel_root.GetPrimPath()}")
+
+        except Exception as e:
+            carb.log_error(f"Error adding animation graph: {e}")
+
+
+    @staticmethod
+    def _find_skel_root(stage, stage_prefix):
+        """Find the SkelRoot prim in the hierarchy"""
+
+        prim = stage.GetPrimAtPath(stage_prefix)
+
+        if prim.GetTypeName() == "SkelRoot":
+            return prim, stage_prefix
+
+        # Recursively search children
+        children = prim.GetAllChildren()
+        if not children:
+            return None, None
+
+        for child in children:
+            child_prim, child_path = StandalonePerson._find_skel_root(
+                stage, stage_prefix + "/" + child.GetName()
+            )
+            if child_prim is not None:
+                return child_prim, child_path
+
+        return None, None
+
+    @staticmethod
+    def get_character_asset_list():
+        """Get list of available character assets"""
+
+        if not StandalonePerson.assets_root_path:
+            carb.log_error("No assets root path configured")
+            return []
+
+        result, folder_list = omni.client.list("{}/".format(StandalonePerson.assets_root_path))
+
+        if result != omni.client.Result.OK:
+            carb.log_error("Unable to get character assets from provided asset root path.")
+            return []
+
+        # Filter for directories only
+        character_list = [
+            folder.relative_path for folder in folder_list
+            if (folder.flags & omni.client.ItemFlags.CAN_HAVE_CHILDREN)
+               and not folder.relative_path.startswith(".")
+        ]
+
+        return character_list
+
+    @staticmethod
+    def get_path_for_character_prim(agent_name):
+        """Get the USD path for a character"""
+
+        if not agent_name or not StandalonePerson.assets_root_path:
+            carb.log_error("Invalid agent name or assets path")
+            return None
+
+        agent_folder = "{}/{}".format(StandalonePerson.assets_root_path, agent_name)
+        result, properties = omni.client.stat(agent_folder)
+
+        if result != omni.client.Result.OK:
+            carb.log_error(f"Character folder does not exist: {agent_folder}")
+            return None
+
+        # Get USD file in the folder
+        character_usd = StandalonePerson._get_usd_in_folder(agent_folder)
+        if not character_usd:
+            return None
+
+        return "{}/{}".format(agent_folder, character_usd)
+
+    @staticmethod
+    def _get_usd_in_folder(character_folder_path):
+        """Find USD file in character folder"""
+
+        result, folder_list = omni.client.list(character_folder_path)
+
+        if result != omni.client.Result.OK:
+            carb.log_error(f"Unable to read character folder path at {character_folder_path}")
+            return None
+
+        for item in folder_list:
+            if item.relative_path.endswith(".usd"):
+                return item.relative_path
+
+        carb.log_error(f"Unable to find a .usd file in {character_folder_path}")
+        return None
+
 
 class ROS2CommandSubscriber(Node):
     """
@@ -63,7 +582,7 @@ class ROS2CommandSubscriber(Node):
         super().__init__('spot_command_subscriber')
         self.subscription = self.create_subscription(
             Twist,
-            f'/{ROBOT_NAME}/cmd_vel',  # Standard topic for velocity commands
+            f'/auto_cmd',  # Standard topic for velocity commands
             self.twist_callback,
             10)  # QoS profile depth
 
@@ -527,7 +1046,7 @@ class StandaloneQuadrupedApp:
             carb.log_info(f"Loading Spot robot from Omniverse URL: {self.usd_path}")
 
             # Create the robot prim path
-            robot_prim_path = "/World/Spot"
+            robot_prim_path = "/World/spot"
 
             # Directly create a reference to the USD file
             import omni.usd
@@ -566,13 +1085,15 @@ class StandaloneQuadrupedApp:
                 position=np.array([0, 0, 0.8]),
             )
 
+            self.setup_people()
+
             carb.log_info("Created Spot robot controller for Omniverse USD")
         else:
             # Local file approach
             try:
                 carb.log_info(f"Attempting to load Spot robot from: {self.usd_path}")
                 self.spot = SpotWithArmFlatTerrainPolicy(
-                    prim_path="/World/Spot",
+                    prim_path="/World/spot",
                     name="Spot",
                     usd_path=self.usd_path,
                     position=np.array([0, 0, 0.8]),
@@ -588,7 +1109,7 @@ class StandaloneQuadrupedApp:
                 carb.log_info(f"Using fallback USD path: {default_usd}")
 
                 self.spot = SpotWithArmFlatTerrainPolicy(
-                    prim_path="/World/Spot",
+                    prim_path="/World/spot",
                     name="Spot",
                     usd_path=default_usd,
                     position=np.array([0, 0, 0.8]),
@@ -662,6 +1183,69 @@ class StandaloneQuadrupedApp:
         except Exception as e:
             carb.log_error(f"Error initializing ROS2 bridge: {e}")
 
+    def setup_people(self):
+        """
+        Set up people with random walking behavior using standalone implementation
+        """
+        # Check if animation modules are available
+        if not globals().get('ANIMATION_AVAILABLE', False):
+            carb.log_warn("Animation modules not available, skipping people setup")
+            return
+
+        try:
+            # Check if we have animation modules available
+            if 'ag' not in globals() or 'PeopleSettings' not in globals():
+                carb.log_warn("Animation modules not properly imported, skipping people setup")
+                return
+
+            # Get available character assets
+            people_assets_list = StandalonePerson.get_character_asset_list()
+            carb.log_info(f"Available people assets: {people_assets_list}")
+
+            if not people_assets_list:
+                carb.log_warn("No people assets found, skipping people setup")
+                return
+
+            # Create multiple people with random walking behavior
+            self.people = []
+            num_people = 3  # Number of people to spawn
+
+            for i in range(num_people):
+                try:
+                    # Random initial position around the robot
+                    init_pos = [
+                        np.random.uniform(-5, 5),  # x
+                        np.random.uniform(-5, 5),  # y
+                        0.0  # z (ground level)
+                    ]
+
+                    # Random person asset
+                    character_name = np.random.choice(people_assets_list)
+
+                    # Create controller
+                    controller = RandomWalkPersonController()
+
+                    # Create person
+                    person = StandalonePerson(
+                        world=self.world,
+                        stage_prefix=f"person_{i}",
+                        character_name=character_name,
+                        init_pos=init_pos,
+                        init_yaw=np.random.uniform(0, 2 * np.pi),
+                        controller=controller
+                    )
+
+                    self.people.append(person)
+                    carb.log_info(f"Created person {i} ({character_name}) at position {init_pos}")
+                except Exception as person_error:
+                    carb.log_error(f"Failed to create person {i}: {person_error}")
+                    continue  # Continue with next person instead of crashing
+
+        except Exception as e:
+            carb.log_error(f"Could not create people: {e}")
+            # Don't let people creation failure stop the robot simulation
+            self.people = []  # Ensure people list exists even if empty
+
     def _find_and_initialize_action_graph(self):
         """
         Find and properly initialize the ROS2_Camera_and_TFs Action Graph using forum solution
@@ -671,8 +1255,8 @@ class StandaloneQuadrupedApp:
         try:
             # Potential paths for the action graph
             graph_paths = [
-                "/World/Spot/ROS2_Camera_and_TFs",
-                "/World/Spot/body/ROS2_Camera_and_TFs"
+                "/World/spot/ROS2_Camera_and_TFs",
+                "/World/spot/body/ROS2_Camera_and_TFs"
             ]
 
             found_graph = None
@@ -696,7 +1280,7 @@ class StandaloneQuadrupedApp:
                     try:
                         graph_path = graph.get_path_to_graph()
                         if "ROS2_Camera_and_TFs" in graph_path or (
-                                "ROS2" in graph_path and "/World/Spot" in graph_path):
+                                "ROS2" in graph_path and "/World/spot" in graph_path):
                             carb.log_info(f"Found matching graph: {graph_path}")
                             found_graph = graph
                             self._action_graph = graph
@@ -765,9 +1349,9 @@ class StandaloneQuadrupedApp:
                         # Set enableImpulse to True using the Controller (forum solution)
                         impulse_attr = f"{node_path}.state:enableImpulse"
                         controller.set(impulse_attr, True)
-                        carb.log_debug(f"Triggered impulse on: {node_path}")
+                        carb.log_info(f"Triggered impulse on: {node_path}")
                     except Exception as e:
-                        carb.log_debug(f"Failed to trigger node {node_path}: {e}")
+                        carb.log_info(f"Failed to trigger node {node_path}: {e}")
                         continue
 
         except Exception as e:
@@ -889,6 +1473,14 @@ class StandaloneQuadrupedApp:
                 carb.log_error(f"Failed to initialize robot: {str(e)}")
                 self._physics_ready = False
 
+        # Ensure people are still active after resets
+        if hasattr(self, 'people') and self.people:
+            for person in self.people:
+                if person._world and not person._world.physics_callback_exists(person._stage_prefix + "/update"):
+                    # Re-add callbacks if they were removed during reset
+                    person._world.add_physics_callback(person._stage_prefix + "/state", person.update_state)
+                    person._world.add_physics_callback(person._stage_prefix + "/update", person.update)
+
         self._physics_counter += 1
 
     def _sub_keyboard_event(self, event, *args, **kwargs):
@@ -988,6 +1580,15 @@ class StandaloneQuadrupedApp:
         # Reset the robot
         if self.spot:
             self.spot.post_reset()
+
+        # Reset people if they exist
+        if hasattr(self, 'people') and self.people:
+            for person in self.people:
+                # Re-establish callbacks after reset
+                person._world.add_physics_callback(person._stage_prefix + "/state", person.update_state)
+                person._world.add_physics_callback(person._stage_prefix + "/update", person.update)
+
+            carb.log_info("Simulation has been reset")
 
         carb.log_info("Simulation has been reset")
 
