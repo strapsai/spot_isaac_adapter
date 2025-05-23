@@ -26,7 +26,7 @@ from isaacsim import SimulationApp
 import time
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import TwistStamped
 import asyncio
 
 # Start Isaac Sim's simulation environment (must be instantiated right after the import)
@@ -581,7 +581,7 @@ class ROS2CommandSubscriber(Node):
     def __init__(self):
         super().__init__('spot_command_subscriber')
         self.subscription = self.create_subscription(
-            Twist,
+            TwistStamped,
             f'/auto_cmd',  # Standard topic for velocity commands
             self.twist_callback,
             10)  # QoS profile depth
@@ -616,9 +616,10 @@ class ROS2CommandSubscriber(Node):
             linear_scale = 1.0  # Adjust based on desired max speed
             angular_scale = 1.0  # Adjust based on desired max turn rate
 
-            self.command[0] = msg.linear.x * linear_scale  # Forward velocity
-            self.command[1] = msg.linear.y * linear_scale  # Lateral velocity
-            self.command[2] = msg.angular.z * angular_scale  # Yaw velocity
+            # Access the twist field of TwistStamped
+            self.command[0] = msg.twist.linear.x * linear_scale  # Forward velocity
+            self.command[1] = msg.twist.linear.y * linear_scale  # Lateral velocity
+            self.command[2] = msg.twist.angular.z * angular_scale  # Yaw velocity
 
             # Apply low-pass filter or limits if needed
             self.command = np.clip(self.command, -2.0, 2.0)  # Limit command range
